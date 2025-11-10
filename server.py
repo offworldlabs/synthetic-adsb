@@ -86,18 +86,18 @@ except json.JSONDecodeError:
 app = Flask(__name__)
 CORS(app)
 
-RADAR_PORTS = [49158, 49159, 49160]
 radar_configs = {}
-for idx, radar in enumerate(RADARS):
-    if idx < len(RADAR_PORTS):
-        port = RADAR_PORTS[idx]
-        radar_configs[port] = {
-            "id": radar["id"],
-            "lat": radar["lat"],
-            "lon": radar["lon"],
-            "alt": radar["alt"],
-            "frequency": FC_MHZ * 1e6
-        }
+for radar in RADARS:
+    if "port" not in radar:
+        raise EnvironmentError(f"Radar {radar.get('id', 'unknown')} missing 'port' field in RADARS config")
+    port = radar["port"]
+    radar_configs[port] = {
+        "id": radar["id"],
+        "lat": radar["lat"],
+        "lon": radar["lon"],
+        "alt": radar["alt"],
+        "frequency": FC_MHZ * 1e6
+    }
 
 def calculate_bistatic_range(aircraft_lat, aircraft_lon, aircraft_alt, tx_lat, tx_lon, tx_alt, rx_lat, rx_lon, rx_alt):
     """Calculate bistatic range (distance from tx to aircraft to rx)."""
@@ -385,8 +385,9 @@ if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
     
     # Always start radar detection servers on their respective ports
-    print(f"[synthetic_adsb_server] starting radar APIs on ports 49158, 49159, 49160")
-    for port in [49158, 49159, 49160]:
+    radar_ports = sorted(radar_configs.keys())
+    print(f"[synthetic_adsb_server] starting radar APIs on ports {', '.join(map(str, radar_ports))}")
+    for port in radar_ports:
         threading.Thread(target=lambda p=port: run_radar_server(p), daemon=True).start()
     
     try:
