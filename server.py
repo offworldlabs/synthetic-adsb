@@ -31,6 +31,7 @@ import time
 import math
 import threading
 import os
+import json
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -59,6 +60,7 @@ REQUIRED_ENV_VARS = [
     "ICAO_HEX",
     "HOST",
     "PORT",
+    "RADARS",
 ]
 for var in REQUIRED_ENV_VARS:
     require_env_var(var)
@@ -76,15 +78,26 @@ ICAO_HEX = os.environ.get("ICAO_HEX")
 HOST = os.environ.get("HOST")
 PORT = int(os.environ.get("PORT"))
 
+try:
+    RADARS = json.loads(os.environ.get("RADARS"))
+except json.JSONDecodeError:
+    raise EnvironmentError("Failed to parse RADARS from environment variable.")
+
 app = Flask(__name__)
 CORS(app)
 
-# Global state for synthetic radar data
-radar_configs = {
-    49158: {"id": "rx1", "lat": -34.9192, "lon": 138.6027, "alt": 110, "frequency": FC_MHZ * 1e6},
-    49159: {"id": "rx2", "lat": -34.9315, "lon": 138.6967, "alt": 408, "frequency": FC_MHZ * 1e6},
-    49160: {"id": "rx3", "lat": -34.8414, "lon": 138.7237, "alt": 230, "frequency": FC_MHZ * 1e6}
-}
+RADAR_PORTS = [49158, 49159, 49160]
+radar_configs = {}
+for idx, radar in enumerate(RADARS):
+    if idx < len(RADAR_PORTS):
+        port = RADAR_PORTS[idx]
+        radar_configs[port] = {
+            "id": radar["id"],
+            "lat": radar["lat"],
+            "lon": radar["lon"],
+            "alt": radar["alt"],
+            "frequency": FC_MHZ * 1e6
+        }
 
 def calculate_bistatic_range(aircraft_lat, aircraft_lon, aircraft_alt, tx_lat, tx_lon, tx_alt, rx_lat, rx_lon, rx_alt):
     """Calculate bistatic range (distance from tx to aircraft to rx)."""
