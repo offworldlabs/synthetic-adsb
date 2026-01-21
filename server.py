@@ -32,10 +32,18 @@ import math
 import threading
 import os
 import json
+import random
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
 import uuid
+from motion_patterns import (
+    MotionPattern,
+    CircularMotion,
+    SupersonicLinearMotion,
+    InstantDirectionChangeMotion,
+    InstantAccelerationMotion,
+)
 
 load_dotenv()
 
@@ -70,6 +78,12 @@ TX_LON = float(os.environ.get("TX_LON"))
 TX_ALT = int(os.environ.get("TX_ALT"))
 FC_MHZ = float(os.environ.get("FC_MHZ"))
 
+# FREEZE_TIMESTAMP: if set to "true", json.now will stay constant
+FREEZE_TIMESTAMP = os.environ.get("FREEZE_TIMESTAMP", "false").lower() == "true"
+FROZEN_TIMESTAMP = time.time() if FREEZE_TIMESTAMP else None
+if FREEZE_TIMESTAMP:
+    print(f"[synthetic_adsb_server] FREEZE_TIMESTAMP enabled - json.now frozen at {FROZEN_TIMESTAMP}")
+
 RADIUS_DEG = float(os.environ.get("RADIUS_DEG"))
 ANGULAR_SPEED = float(os.environ.get("ANGULAR_SPEED"))
 ALT_BARO_FT = int(os.environ.get("ALT_BARO_FT"))
@@ -82,6 +96,15 @@ try:
     RADARS = json.loads(os.environ.get("RADARS"))
 except json.JSONDecodeError:
     raise EnvironmentError("Failed to parse RADARS from environment variable.")
+
+ENABLE_ANOMALIES = os.environ.get("ENABLE_ANOMALIES", "false").lower() == "true"
+NORMAL_AIRCRAFT_COUNT = int(os.environ.get("NORMAL_AIRCRAFT_COUNT", "1"))
+ANOMALOUS_AIRCRAFT_COUNT = int(os.environ.get("ANOMALOUS_AIRCRAFT_COUNT", "0")) if ENABLE_ANOMALIES else 0
+ANOMALY_ADSB_PROBABILITY = float(os.environ.get("ANOMALY_ADSB_PROBABILITY", "0.1"))
+
+SUPERSONIC_MACH_MIN = float(os.environ.get("SUPERSONIC_MACH_MIN", "2.0"))
+SUPERSONIC_MACH_MAX = float(os.environ.get("SUPERSONIC_MACH_MAX", "5.0"))
+SUPERSONIC_ALTITUDE_FT = int(os.environ.get("SUPERSONIC_ALTITUDE_FT", "50000"))
 
 app = Flask(__name__)
 CORS(app)
@@ -98,6 +121,186 @@ for radar in RADARS:
         "alt": radar["alt"],
         "frequency": FC_MHZ * 1e6
     }
+
+
+class Aircraft:
+    """Represents a single aircraft with its motion pattern and properties."""
+
+    def __init__(
+        self,
+        icao_hex,
+        motion_pattern,
+        altitude_ft,
+        flight_number,
+        is_anomalous=False,
+        has_adsb=True,
+        adsb_accurate=True,
+        adsb_gs_override=None,
+        adsb_track_override=None,
+    ):
+        self.icao_hex = icao_hex
+        self.motion_pattern = motion_pattern
+        self.altitude_ft = altitude_ft
+        self.flight_number = flight_number
+        self.is_anomalous = is_anomalous
+        self.has_adsb = has_adsb
+        self.adsb_accurate = adsb_accurate
+        self.adsb_gs_override = adsb_gs_override
+        self.adsb_track_override = adsb_track_override
+
+    def get_data(self, current_time, timestamp_for_json):
+        lat, lon = self.motion_pattern.get_position(current_time)
+        actual_gs_knots = self.motion_pattern.get_velocity(current_time)
+        actual_track_deg = self.motion_pattern.get_heading(current_time)
+
+        if not self.has_adsb:
+            return None
+
+        if self.adsb_accurate:
+            gs_knots = actual_gs_knots
+            track_deg = actual_track_deg
+        else:
+            gs_knots = self.adsb_gs_override if self.adsb_gs_override is not None else actual_gs_knots
+            track_deg = self.adsb_track_override if self.adsb_track_override is not None else actual_track_deg
+
+        return {
+            "hex": self.icao_hex,
+            "lat": round(lat, 6),
+            "lon": round(lon, 6),
+            "alt_baro": self.altitude_ft,
+            "alt_geom": self.altitude_ft + 100,
+            "gs": round(gs_knots, 1),
+            "track": round(track_deg, 2),
+            "true_heading": round(track_deg, 2),
+            "flight": self.flight_number,
+            "seen_pos": 0,
+        }
+
+
+class AircraftManager:
+    """Manages multiple aircraft with different motion patterns."""
+
+    def __init__(self):
+        self.aircraft_list = []
+        self._initialize_aircraft()
+
+    def _generate_icao_hex(self, index):
+        base_hex = int(ICAO_HEX, 16) if ICAO_HEX else 0xAEF123
+        return f"{(base_hex + index):06X}"
+
+    def _initialize_aircraft(self):
+        aircraft_index = 0
+
+        for i in range(NORMAL_AIRCRAFT_COUNT):
+            icao_hex = self._generate_icao_hex(aircraft_index)
+            motion = CircularMotion(TX_LAT, TX_LON, RADIUS_DEG, ANGULAR_SPEED)
+            flight_number = f"SYN{aircraft_index + 1:03d}  "
+
+            aircraft = Aircraft(
+                icao_hex=icao_hex,
+                motion_pattern=motion,
+                altitude_ft=ALT_BARO_FT,
+                flight_number=flight_number,
+                is_anomalous=False,
+            )
+            self.aircraft_list.append(aircraft)
+            aircraft_index += 1
+
+        for i in range(ANOMALOUS_AIRCRAFT_COUNT):
+            icao_hex = self._generate_icao_hex(aircraft_index)
+            direction = random.uniform(0, 360)
+            start_lat = TX_LAT + random.uniform(-0.1, 0.1)
+            start_lon = TX_LON + random.uniform(-0.1, 0.1)
+
+            anomaly_type = random.choice(["supersonic", "direction_change", "acceleration"])
+
+            if anomaly_type == "supersonic":
+                mach = random.uniform(SUPERSONIC_MACH_MIN, SUPERSONIC_MACH_MAX)
+                motion = SupersonicLinearMotion(
+                    start_lat=start_lat,
+                    start_lon=start_lon,
+                    mach_number=mach,
+                    direction_deg=direction,
+                )
+                altitude_ft = SUPERSONIC_ALTITUDE_FT
+
+            elif anomaly_type == "direction_change":
+                velocity_knots = random.uniform(400, 600)
+                change_interval = random.uniform(3.0, 7.0)
+                motion = InstantDirectionChangeMotion(
+                    start_lat=start_lat,
+                    start_lon=start_lon,
+                    velocity_knots=velocity_knots,
+                    initial_direction_deg=direction,
+                    change_interval_sec=change_interval,
+                )
+                altitude_ft = random.randint(20000, 40000)
+
+            else:
+                speed_profile = [
+                    (3.0, random.uniform(300, 500)),
+                    (2.0, 0),
+                    (3.0, random.uniform(500, 700)),
+                    (4.0, random.uniform(200, 400)),
+                ]
+                motion = InstantAccelerationMotion(
+                    start_lat=start_lat,
+                    start_lon=start_lon,
+                    direction_deg=direction,
+                    speed_profile=speed_profile,
+                )
+                altitude_ft = random.randint(15000, 35000)
+
+            flight_number = f"ANOM{i + 1:02d}   "
+
+            has_adsb = random.random() < ANOMALY_ADSB_PROBABILITY
+            adsb_accurate = True
+            adsb_gs_override = None
+            adsb_track_override = None
+
+            if has_adsb and anomaly_type == "supersonic":
+                adsb_accurate = random.random() < 0.3
+                if not adsb_accurate:
+                    adsb_gs_override = random.uniform(300, 500)
+                    adsb_track_override = direction + random.uniform(-30, 30)
+
+            aircraft = Aircraft(
+                icao_hex=icao_hex,
+                motion_pattern=motion,
+                altitude_ft=altitude_ft,
+                flight_number=flight_number,
+                is_anomalous=True,
+                has_adsb=has_adsb,
+                adsb_accurate=adsb_accurate,
+                adsb_gs_override=adsb_gs_override,
+                adsb_track_override=adsb_track_override,
+            )
+            self.aircraft_list.append(aircraft)
+            aircraft_index += 1
+
+    def get_all_aircraft_data(self, current_time, timestamp_for_json):
+        data = [aircraft.get_data(current_time, timestamp_for_json) for aircraft in self.aircraft_list]
+        return [d for d in data if d is not None]
+
+    def get_all_aircraft_for_radar(self, current_time):
+        aircraft_data = []
+        for aircraft in self.aircraft_list:
+            lat, lon = aircraft.motion_pattern.get_position(current_time)
+            gs_knots = aircraft.motion_pattern.get_velocity(current_time)
+            track_deg = aircraft.motion_pattern.get_heading(current_time)
+
+            aircraft_data.append({
+                "hex": aircraft.icao_hex,
+                "lat": lat,
+                "lon": lon,
+                "alt_geom": aircraft.altitude_ft + 100,
+                "gs": gs_knots,
+                "track": track_deg,
+            })
+        return aircraft_data
+
+
+aircraft_manager = AircraftManager()
 
 def calculate_bistatic_range(aircraft_lat, aircraft_lon, aircraft_alt, tx_lat, tx_lon, tx_alt, rx_lat, rx_lon, rx_alt):
     """Calculate bistatic range (distance from tx to aircraft to rx)."""
@@ -122,116 +325,96 @@ def calculate_bistatic_range(aircraft_lat, aircraft_lon, aircraft_alt, tx_lat, t
     
     return tx_to_aircraft + aircraft_to_rx
 
-def generate_synthetic_detection(aircraft_data, radar_config):
-    """Generate synthetic radar detection for given aircraft and radar."""
-    if not aircraft_data:
-        return None
-        
-    aircraft = aircraft_data[0]  # Single aircraft
-    
-    # Calculate bistatic range
-    bistatic_range = calculate_bistatic_range(
-        aircraft["lat"], aircraft["lon"], aircraft["alt_geom"] * 0.3048,  # Convert feet to meters
-        TX_LAT, TX_LON, TX_ALT,
-        radar_config["lat"], radar_config["lon"], radar_config["alt"]
-    )
-    
-    # Calculate approximate doppler (simplified)
-    # This is a rough approximation for circular motion
+def generate_synthetic_detections(aircraft_data_list, radar_config):
+    """Generate synthetic radar detections for all aircraft and given radar."""
+    if not aircraft_data_list:
+        return []
+
+    detections = []
     now = time.time()
-    theta = (now * ANGULAR_SPEED) % (2 * math.pi)
-    velocity_magnitude = RADIUS_DEG * 111320 * ANGULAR_SPEED  # Convert to m/s
-    doppler_shift = velocity_magnitude * math.cos(theta) * 2 * radar_config["frequency"] / 299792458
-    
-    return {
-        "detection_id": str(uuid.uuid4()),
-        "timestamp": now,
-        "bistatic_range_m": round(bistatic_range, 2),
-        "doppler_hz": round(doppler_shift, 2),
-        "snr_db": 15.0 + (hash(aircraft["hex"]) % 10),  # Synthetic SNR
-        "radar_id": radar_config["id"],
-        "frequency_hz": radar_config["frequency"]
-    }
+
+    for aircraft in aircraft_data_list:
+        bistatic_range = calculate_bistatic_range(
+            aircraft["lat"],
+            aircraft["lon"],
+            aircraft["alt_geom"] * 0.3048,
+            TX_LAT,
+            TX_LON,
+            TX_ALT,
+            radar_config["lat"],
+            radar_config["lon"],
+            radar_config["alt"],
+        )
+
+        velocity_ms = aircraft["gs"] * 0.514444
+        doppler_shift = velocity_ms * 2 * radar_config["frequency"] / 299792458
+
+        detection = {
+            "detection_id": str(uuid.uuid4()),
+            "timestamp": now,
+            "bistatic_range_m": round(bistatic_range, 2),
+            "doppler_hz": round(doppler_shift, 2),
+            "snr_db": 15.0 + (hash(aircraft["hex"]) % 10),
+            "radar_id": radar_config["id"],
+            "frequency_hz": radar_config["frequency"],
+            "icao_hex": aircraft["hex"],
+        }
+        detections.append(detection)
+
+    return detections
 
 
 @app.route("/data/aircraft.json")
 def serve_synthetic_adsb():
     """
-    Generate one circular-flight aircraft at the current time.
+    Generate aircraft data for all configured aircraft (normal + anomalous).
     """
+    timestamp_for_json = FROZEN_TIMESTAMP if FREEZE_TIMESTAMP else time.time()
     now = time.time()
-    theta = (now * ANGULAR_SPEED) % (2 * math.pi)
 
-    lat = TX_LAT + RADIUS_DEG * math.cos(theta)
-    lon = TX_LON + RADIUS_DEG * math.sin(theta)
+    aircraft_data = aircraft_manager.get_all_aircraft_data(now, timestamp_for_json)
 
-    dlat_dt = -RADIUS_DEG * ANGULAR_SPEED * math.sin(theta)
-    dlon_dt = RADIUS_DEG * ANGULAR_SPEED * math.cos(theta)
-
-    dlat_dt_m = dlat_dt * 111320
-    dlon_dt_m = dlon_dt * 111320 * math.cos(math.radians(lat))
-
-    speed_ms = math.sqrt(dlat_dt_m**2 + dlon_dt_m**2)
-    gs_knots = speed_ms * 1.94384
-
-    track_rad = math.atan2(dlon_dt_m, dlat_dt_m)
-    track_deg = math.degrees(track_rad) % 360
-
-    aircraft = {
-        "hex": ICAO_HEX,
-        "lat": round(lat, 6),
-        "lon": round(lon, 6),
-        "alt_baro": ALT_BARO_FT,
-        "alt_geom": ALT_BARO_FT
-        + 100,
-        "gs": round(gs_knots, 1),
-        "track": round(track_deg, 2),
-        "true_heading": round(track_deg, 2),
-        "flight": "SYN001  ",
-        "seen_pos": 0,
-    }
-
-    return jsonify({"now": now, "aircraft": [aircraft]})
+    return jsonify({"now": timestamp_for_json, "aircraft": aircraft_data})
 
 
 @app.route("/api/detection")
 def radar_detection():
     """Generate synthetic radar detection data in blah2 format."""
-    port = request.environ.get('SERVER_PORT', 5001)
+    port = request.environ.get("SERVER_PORT", 5001)
     try:
         port = int(port)
     except:
         port = 5001
-    
-    # Get radar config for this port
+
     radar_config = radar_configs.get(port)
     if not radar_config:
-        # Default config if port not found
         radar_config = radar_configs[49158]
-    
-    # Get current aircraft data
-    aircraft_response = serve_synthetic_adsb()
-    aircraft_data = aircraft_response.get_json()["aircraft"]
-    
+
+    current_time = time.time()
+    aircraft_data = aircraft_manager.get_all_aircraft_for_radar(current_time)
+
     delays = []
     dopplers = []
-    
+    snrs = []
+
     if aircraft_data:
-        detection = generate_synthetic_detection(aircraft_data, radar_config)
-        if detection:
-            # Convert bistatic range to delay (distance/speed of light)
+        detections = generate_synthetic_detections(aircraft_data, radar_config)
+        for detection in detections:
             delay_seconds = detection["bistatic_range_m"] / 299792458
             delays.append(delay_seconds)
             dopplers.append(detection["doppler_hz"])
-    
+            snrs.append(detection["snr_db"])
+
     current_time = time.time()
-    return jsonify({
-        "timestamp": int(current_time * 1000),  # milliseconds for blah2 format
-        "delay": delays,
-        "doppler": dopplers,
-        "snr": [15.0] * len(delays) if delays else [],
-        "status": "active"
-    })
+    return jsonify(
+        {
+            "timestamp": int(current_time * 1000),
+            "delay": delays,
+            "doppler": dopplers,
+            "snr": snrs,
+            "status": "active",
+        }
+    )
 
 
 @app.route("/api/config")
@@ -306,37 +489,38 @@ def create_radar_app(port):
     def radar_detection():
         """Generate synthetic radar detection data in blah2 format."""
         radar_config = radar_configs.get(port, radar_configs[49158])
-        
-        # Get current aircraft data
-        aircraft_response = serve_synthetic_adsb()
-        aircraft_data = aircraft_response.get_json()["aircraft"]
-        
+
+        current_time = time.time()
+        aircraft_data = aircraft_manager.get_all_aircraft_for_radar(current_time)
+
         delays = []
         dopplers = []
-        
+        snrs = []
+
         if aircraft_data:
-            detection = generate_synthetic_detection(aircraft_data, radar_config)
-            if detection:
-                # Convert bistatic range from meters to kilometers
+            detections = generate_synthetic_detections(aircraft_data, radar_config)
+            for detection in detections:
                 delay_km = detection["bistatic_range_m"] / 1000.0
-                
-                # Validation: Ensure realistic range values (10-200 km typical for aircraft)
+
                 if delay_km < 5.0:
                     print(f"WARNING: Unrealistically small bistatic range: {delay_km:.3f} km")
                 elif delay_km > 300.0:
                     print(f"WARNING: Unrealistically large bistatic range: {delay_km:.3f} km")
-                
+
                 delays.append(delay_km)
                 dopplers.append(detection["doppler_hz"])
-        
+                snrs.append(detection["snr_db"])
+
         current_time = time.time()
-        return jsonify({
-            "timestamp": int(current_time * 1000),
-            "delay": delays,
-            "doppler": dopplers,
-            "snr": [15.0] * len(delays) if delays else [],
-            "status": "active"
-        })
+        return jsonify(
+            {
+                "timestamp": int(current_time * 1000),
+                "delay": delays,
+                "doppler": dopplers,
+                "snr": snrs,
+                "status": "active",
+            }
+        )
     
     @radar_app.route("/api/config")
     def radar_config_endpoint():
